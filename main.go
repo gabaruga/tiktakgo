@@ -61,7 +61,7 @@ type model struct {
 }
 
 var pieces = map[int]rune{
-	1:  '◯',
+	1:  '○',
 	-1: '×',
 	2:  '-',
 	3:  '|',
@@ -94,16 +94,19 @@ func updateCell(m *model, x int, y int) {
 	}
 
 	// check if row is the same player
+	var victory = false
 	if m.board[x][0] == m.board[x][1] && m.board[x][1] == m.board[x][2] {
 		m.board[x][0] = 2
 		m.board[x][1] = 2
 		m.board[x][2] = 2
+		victory = true
 	}
 	// check if column is the same player
 	if m.board[0][y] == m.board[1][y] && m.board[1][y] == m.board[2][y] {
 		m.board[0][y] = 3
 		m.board[1][y] = 3
 		m.board[2][y] = 3
+		victory = true
 	}
 	// check if diagonal is the same player
 	if m.board[0][0] == m.board[1][1] && m.board[1][1] == m.board[2][2] {
@@ -111,6 +114,7 @@ func updateCell(m *model, x int, y int) {
 			m.board[0][0] = 4
 			m.board[1][1] = 4
 			m.board[2][2] = 4
+			victory = true
 		}
 	}
 	// Check secondary diagonal
@@ -119,6 +123,14 @@ func updateCell(m *model, x int, y int) {
 			m.board[0][2] = 5
 			m.board[1][1] = 5
 			m.board[2][0] = 5
+			victory = true
+		}
+	}
+	if victory {
+		if m.currentPlayer != 1 {
+			m.player1_score++
+		} else {
+			m.player2_score++
 		}
 	}
 }
@@ -141,6 +153,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.currentPlayer *= -1
 				case -1:
 					m.player2_name = m.textInput.Value()
+					m.currentPlayer *= -1
 					m.view = 1
 				}
 			default:
