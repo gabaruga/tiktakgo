@@ -1,36 +1,99 @@
 package main
 
-// A simple program that counts down from 5 and then exits.
+// An example Bubble Tea server. This will put an ssh session into alt screen
+// and continually print up to date terminal information.
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"log"
+	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/log"
+	"github.com/charmbracelet/ssh"
+	"github.com/charmbracelet/wish"
+	"github.com/charmbracelet/wish/activeterm"
+	"github.com/charmbracelet/wish/bubbletea"
+	"github.com/charmbracelet/wish/logging"
+)
+
+const (
+	host = "0.0.0.0"
+	port = "23234"
 )
 
 func main() {
-	// Log to a file. Useful in debugging since you can't really log to stdout.
-	// Not required.
-	logfilePath := os.Getenv("BUBBLETEA_LOG")
-	if logfilePath != "" {
-		if _, err := tea.LogToFile(logfilePath, "simple"); err != nil {
-			log.Fatal(err)
-		}
+	s, err := wish.NewServer(
+		wish.WithAddress(net.JoinHostPort(host, port)),
+		wish.WithHostKeyPath(".ssh/id_ed25519"),
+		wish.WithMiddleware(
+			bubbletea.Middleware(teaHandler),
+			activeterm.Middleware(), // Bubble Tea apps usually require a PTY.
+			logging.Middleware(),
+		),
+	)
+	if err != nil {
+		log.Error("Could not start server", "error", err)
 	}
 
-	// Initialize our program
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	log.Info("Starting SSH server", "host", host, "port", port)
+	go func() {
+		if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+			log.Error("Could not start server", "error", err)
+			done <- nil
+		}
+	}()
+
+	<-done
+	log.Info("Stopping SSH server")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer func() { cancel() }()
+	if err := s.Shutdown(ctx); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+		log.Error("Could not stop server", "error", err)
+	}
+}
+
+// You can wire any Bubble Tea model up to the middleware with a function that
+// handles the incoming ssh.Session. Here we just grab the terminal info and
+// pass it to the new model. You can also return tea.ProgramOptions (such as
+// tea.WithAltScreen) on a session by session basis.
+func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	// This should never fail, as we are using the activeterm middleware.
+	pty, _, _ := s.Pty()
+
+	// When running a Bubble Tea app over SSH, you shouldn't use the default
+	// lipgloss.NewStyle function.
+	// That function will use the color profile from the os.Stdin, which is the
+	// server, not the client.
+	// We provide a MakeRenderer function in the bubbletea middleware package,
+	// so you can easily get the correct renderer for the current session, and
+	// use it to create the styles.
+	// The recommended way to use these styles is to then pass them down to
+	// your Bubble Tea model.
+	renderer := bubbletea.MakeRenderer(s)
+	txtStyle := renderer.NewStyle().Foreground(lipgloss.Color("10"))
+	quitStyle := renderer.NewStyle().Foreground(lipgloss.Color("8"))
+
+	bg := "light"
+	if renderer.HasDarkBackground() {
+		bg = "dark"
+	}
+
 	ti := textinput.New()
 	ti.Placeholder = "Player 1 name?"
 	ti.Focus()
 	ti.CharLimit = 20
 	ti.Width = 20
-
-	p := tea.NewProgram(model{
-		tick:          0,
+	m := model{
 		view:          0,
 		currentPlayer: 1,
 		textInput:     ti,
@@ -39,17 +102,18 @@ func main() {
 			{0, 0, 0},
 			{0, 0, 0},
 		},
-	}, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
+		term:      pty.Term,
+		width:     pty.Window.Width,
+		height:    pty.Window.Height,
+		bg:        bg,
+		txtStyle:  txtStyle,
+		quitStyle: quitStyle,
 	}
+	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
-// A model can be more or less any type of data. It holds all the data for a
-// program, so often it's a struct. For this simple example, however, all
-// we'll need is a simple integer.
+// Just a generic tea.Model to demo terminal information of ssh.
 type model struct {
-	tick          int
 	board         [][]int
 	currentPlayer int
 	player1_name  string
@@ -58,6 +122,12 @@ type model struct {
 	player2_score int
 	view          int
 	textInput     textinput.Model
+	txtStyle      lipgloss.Style
+	quitStyle     lipgloss.Style
+	term          string
+	width         int
+	height        int
+	bg            string
 }
 
 var pieces = map[int]rune{
@@ -70,20 +140,6 @@ var pieces = map[int]rune{
 	0:  ' ',
 }
 
-// Init optionally returns an initial command we should run. In this case we
-// want to start the timer.
-func (m model) Init() tea.Cmd {
-	if m.tick > 0 {
-		return tick
-	}
-
-	if m.view == 0 {
-		return textinput.Blink
-	}
-
-	return nil
-}
-
 func updateCell(m *model, x int, y int) {
 	var cell = &m.board[x][y]
 	if *cell == 0 {
@@ -92,7 +148,6 @@ func updateCell(m *model, x int, y int) {
 	} else if *cell == 1 || *cell == -1 {
 		*cell *= -1
 	}
-
 	// check if row is the same player
 	var victory = false
 	if m.board[x][0] == m.board[x][1] && m.board[x][1] == m.board[x][2] {
@@ -135,11 +190,16 @@ func updateCell(m *model, x int, y int) {
 	}
 }
 
-// Update is called when messages are received. The idea is that you inspect the
-// message and send back an updated model accordingly. You can also return
-// a command, which is a function that performs I/O and returns a message.
+// ---------- Bubbletea functions -------------
+func (m model) Init() tea.Cmd {
+	return textinput.Blink
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+		m.width = msg.Width
 	case tea.KeyMsg:
 		switch m.view {
 		case 0:
@@ -198,18 +258,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-	case tickMsg:
-		m.tick--
-		if m.tick <= 0 {
-			return m, tea.Quit
-		}
-		return m, tick
 	}
 	return m, nil
 }
 
-// View returns a string based on data in the model. That string which will be
-// rendered to the terminal.
+//	func (m model) View() string {
+//		s := fmt.Sprintf("Your term is %s\nYour window size is %dx%d\nBackground: %s\n", m.term, m.width, m.height, m.bg)
+//		return m.txtStyle.Render(s) + "\n\n" + m.quitStyle.Render("Press 'q' to quit\n")
+//	}
 func (m model) View() string {
 	v := "Tik-Tag-Go"
 	switch m.view {
@@ -232,13 +288,4 @@ func (m model) View() string {
 			pieces[m.board[2][2]])
 	}
 	return v
-}
-
-// Messages are events that we respond to in our Update function. This
-// particular one indicates that the timer has ticked.
-type tickMsg time.Time
-
-func tick() tea.Msg {
-	time.Sleep(time.Second)
-	return tickMsg{}
 }
