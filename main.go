@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,16 +26,79 @@ import (
 )
 
 const (
-	host = "0.0.0.0"
+	// host = "0.0.0.0"
+	host = "localhost"
 	port = "23234"
 )
 
+var pieces = map[int]rune{
+	1:  '○',
+	-1: '×',
+	2:  '-',
+	3:  '|',
+	4:  '\\',
+	5:  '/',
+	0:  ' ',
+}
+
+type player struct {
+	name      string
+	score     int
+	txtStyle  lipgloss.Style
+	quitStyle lipgloss.Style
+	term      string
+	width     int
+	height    int
+	bg        string
+	ch        chan tea.Msg
+}
+
+type model struct {
+	board         [][]int
+	currentPlayer int
+	view          int
+	textInput     textinput.Model
+	players       [2]player
+}
+
+type gameState struct {
+	players  [2]*ssh.Session
+	mu       sync.Mutex
+	m        model
+	sessions map[string]chan tea.Msg
+}
+
+var state = gameState{
+	m:        newBubbleteaModel(),
+	sessions: make(map[string]chan tea.Msg),
+}
+
+func newBubbleteaModel() model {
+	// initialize tea model
+	ti := textinput.New()
+	ti.Focus()
+	ti.CharLimit = 20
+	ti.Width = 20
+	return model{
+		view:          1,
+		currentPlayer: 1,
+		textInput:     ti,
+		board: [][]int{
+			{0, 0, 0},
+			{0, 0, 0},
+			{0, 0, 0},
+		},
+	}
+}
+
 func main() {
+	// start app server
 	s, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(host, port)),
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
 		wish.WithMiddleware(
 			bubbletea.Middleware(teaHandler),
+			// gameHandler(),
 			activeterm.Middleware(), // Bubble Tea apps usually require a PTY.
 			logging.Middleware(),
 		),
@@ -62,82 +126,120 @@ func main() {
 	}
 }
 
-// You can wire any Bubble Tea model up to the middleware with a function that
-// handles the incoming ssh.Session. Here we just grab the terminal info and
-// pass it to the new model. You can also return tea.ProgramOptions (such as
-// tea.WithAltScreen) on a session by session basis.
+// RegisterSession registers a new session to receive updates.
+func (gs *gameState) RegisterSession(id string, ch chan tea.Msg) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.sessions[id] = ch
+	if gs.m.players[0].ch == nil {
+		gs.m.players[0].ch = ch
+	} else {
+		gs.m.players[1].ch = ch
+	}
+
+	go func() {
+		for {
+			<-ch
+			state.BroadcastMessage(redraw)
+		}
+	}()
+}
+
+// UnregisterSession removes a session from receiving updates.
+func (gs *gameState) UnregisterSession(id string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	delete(gs.sessions, id)
+}
+
+// BroadcastMessage sends a message to all registered sessions.
+func (gs *gameState) BroadcastMessage(msg tea.Msg) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	for _, ch := range gs.sessions {
+		ch <- msg
+	}
+}
+
+// UpdateModel updates the global model and broadcasts the change.
+// func (gs *gameState) UpdateModel(msg tea.Msg) {
+// 	gs.mu.Lock()
+// 	defer gs.mu.Unlock()
+// 	m, _ := gs.m.Update(msg)
+// 	gs.m = m.(model)
+// 	gs.BroadcastMessage(msg)
+// }
+
+// // You can wire any Bubble Tea model up to the middleware with a function that
+// // handles the incoming ssh.Session. Here we just grab the terminal info and
+// // pass it to the new model. You can also return tea.ProgramOptions (such as
+// // tea.WithAltScreen) on a session by session basis.
+// func gameHandler() wish.Middleware {
+// 	// sessionID := s.Context().Value(ssh.ContextKeySessionID).(string)
+// 	// msgCh := make(chan tea.Msg)
+// 	// state.RegisterSession(sessionID, msgCh)
+// 	// defer state.UnregisterSession(sessionID)
+
+// 	// Initialize bubbletea program for this session.
+// 	p := tea.NewProgram(state.m)
+// 	// Goroutine to listen for global state updates and send them to the session's program.
+// 	// go func() {
+// 	// 	for msg := range msgCh {
+// 	// 		p.Send(msg)
+// 	// 	}
+// 	// }()
+// 	return bubbletea.MiddlewareWithProgramHandler(teaHandler, termenv.ANSI256)
+// 	// Start the bubbletea program.
+// 	if _, err := p.Run(); err != nil {
+// 		fmt.Println("Error:", err)
+// 	}
+
+// }
+
 func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	// This should never fail, as we are using the activeterm middleware.
-	pty, _, _ := s.Pty()
+	log.Info("debug", "len", cap(state.players))
 
-	// When running a Bubble Tea app over SSH, you shouldn't use the default
-	// lipgloss.NewStyle function.
-	// That function will use the color profile from the os.Stdin, which is the
-	// server, not the client.
-	// We provide a MakeRenderer function in the bubbletea middleware package,
-	// so you can easily get the correct renderer for the current session, and
-	// use it to create the styles.
-	// The recommended way to use these styles is to then pass them down to
-	// your Bubble Tea model.
-	renderer := bubbletea.MakeRenderer(s)
-	txtStyle := renderer.NewStyle().Foreground(lipgloss.Color("10"))
-	quitStyle := renderer.NewStyle().Foreground(lipgloss.Color("8"))
+	sessionID := s.Context().Value(ssh.ContextKeySessionID).(string)
+	msgCh := make(chan tea.Msg)
+	state.RegisterSession(sessionID, msgCh)
+	defer state.UnregisterSession(sessionID)
 
-	bg := "light"
-	if renderer.HasDarkBackground() {
-		bg = "dark"
+	// Manage user sessions
+	if state.players[0] == nil {
+		state.players[0] = &s
+		pty, _, _ := s.Pty()
+		renderer := bubbletea.MakeRenderer(s)
+		state.m.players[0].txtStyle = renderer.NewStyle().Foreground(lipgloss.Color("10"))
+		state.m.players[0].quitStyle = renderer.NewStyle().Foreground(lipgloss.Color("8"))
+		state.m.players[0].bg = "light"
+		if renderer.HasDarkBackground() {
+			state.m.players[0].bg = "dark"
+		}
+		state.m.players[0].name = s.User()
+		state.m.players[0].term = pty.Term
+		state.m.players[0].width = pty.Window.Width
+		state.m.players[0].height = pty.Window.Height
+		log.Info("Connected player 1:", "name", s.User())
+	} else if state.players[1] == nil {
+		state.players[1] = &s
+		pty, _, _ := s.Pty()
+		renderer := bubbletea.MakeRenderer(s)
+		state.m.players[1].txtStyle = renderer.NewStyle().Foreground(lipgloss.Color("10"))
+		state.m.players[1].quitStyle = renderer.NewStyle().Foreground(lipgloss.Color("8"))
+		state.m.players[1].bg = "light"
+		if renderer.HasDarkBackground() {
+			state.m.players[1].bg = "dark"
+		}
+		state.m.players[1].name = s.User()
+		state.m.players[1].term = pty.Term
+		state.m.players[1].width = pty.Window.Width
+		state.m.players[1].height = pty.Window.Height
+		log.Info("Connected player 2:", "name", s.User())
+	} else {
+		s.Close()
 	}
-
-	ti := textinput.New()
-	ti.Placeholder = "Player 1 name?"
-	ti.Focus()
-	ti.CharLimit = 20
-	ti.Width = 20
-	m := model{
-		view:          0,
-		currentPlayer: 1,
-		textInput:     ti,
-		board: [][]int{
-			{0, 0, 0},
-			{0, 0, 0},
-			{0, 0, 0},
-		},
-		term:      pty.Term,
-		width:     pty.Window.Width,
-		height:    pty.Window.Height,
-		bg:        bg,
-		txtStyle:  txtStyle,
-		quitStyle: quitStyle,
-	}
-	return m, []tea.ProgramOption{tea.WithAltScreen()}
-}
-
-// Just a generic tea.Model to demo terminal information of ssh.
-type model struct {
-	board         [][]int
-	currentPlayer int
-	player1_name  string
-	player1_score int
-	player2_name  string
-	player2_score int
-	view          int
-	textInput     textinput.Model
-	txtStyle      lipgloss.Style
-	quitStyle     lipgloss.Style
-	term          string
-	width         int
-	height        int
-	bg            string
-}
-
-var pieces = map[int]rune{
-	1:  '○',
-	-1: '×',
-	2:  '-',
-	3:  '|',
-	4:  '\\',
-	5:  '/',
-	0:  ' ',
+	return state.m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
 func updateCell(m *model, x int, y int) {
@@ -183,23 +285,33 @@ func updateCell(m *model, x int, y int) {
 	}
 	if victory {
 		if m.currentPlayer != 1 {
-			m.player1_score++
+			m.players[0].score++
 		} else {
-			m.player2_score++
+			m.players[1].score++
 		}
 	}
 }
 
+type redrawMsg string
+
+func redraw() tea.Msg {
+	return redrawMsg("")
+}
+
 // ---------- Bubbletea functions -------------
 func (m model) Init() tea.Cmd {
-	return textinput.Blink
+	// return textinput.Blink
+	return nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case redrawMsg:
+		m.players[0].txtStyle.Render(m.View())
+		return m, nil
 	case tea.WindowSizeMsg:
-		m.height = msg.Height
-		m.width = msg.Width
+		m.players[0].height = msg.Height
+		m.players[0].width = msg.Width
 	case tea.KeyMsg:
 		switch m.view {
 		case 0:
@@ -207,12 +319,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				switch m.currentPlayer {
 				case 1:
-					m.player1_name = m.textInput.Value()
+					m.players[0].name = m.textInput.Value()
 					m.textInput.Placeholder = "Player 2 name?"
 					m.textInput.Reset()
 					m.currentPlayer *= -1
 				case -1:
-					m.player2_name = m.textInput.Value()
+					m.players[1].name = m.textInput.Value()
 					m.currentPlayer *= -1
 					m.view = 1
 				}
@@ -256,6 +368,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					{0, 0, 0},
 				}
 			}
+			// state.BroadcastMessage(redraw)
+			// m.players[0].ch <- "0"
 			return m, nil
 		}
 	}
@@ -273,10 +387,10 @@ func (m model) View() string {
 		v = m.textInput.View()
 	case 1:
 		v = fmt.Sprintf("%s: %d\n%s: %d\n┏━┳━┳━┓\n┃%c┃%c┃%c┃\n┣━╋━╋━┫\n┃%c┃%c┃%c┃\n┣━╋━╋━┫\n┃%c┃%c┃%c┃\n┗━┻━┻━┛",
-			m.player1_name,
-			m.player1_score,
-			m.player2_name,
-			m.player2_score,
+			m.players[0].name,
+			m.players[0].score,
+			m.players[1].name,
+			m.players[1].score,
 			pieces[m.board[0][0]],
 			pieces[m.board[0][1]],
 			pieces[m.board[0][2]],
